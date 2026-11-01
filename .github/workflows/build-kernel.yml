@@ -1,0 +1,172 @@
+name: Build kernel (stone - modular)
+
+# Repo CI mandiri: TIDAK berada di dalam repo kernel. Workflow meng-checkout source
+# kernel (upstream atau fork kamu), menerapkan fitur yang dipilih di bawah
+# (features/<nama>/), membangun Image, lalu membuat zip AnyKernel3 yang bisa
+# di-flash. Semua logika ada di scripts/, workflow ini hanya mengurutkan langkahnya.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Repo kernel (owner/nama). Upstream atau fork kamu."
+        required: true
+        default: "crdroidandroid/android_kernel_xiaomi_stone"
+      kernel_branch:
+        description: "Branch kernel (16.0 = Android 16)"
+        required: true
+        default: "16.0"
+      bakasu:
+        description: "BakaSU root (manual hook, tanpa SUSFS)"
+        type: boolean
+        required: true
+        default: true
+      bakasu_ref:
+        description: "Branch atau tag BakaSU (dipakai kalau BakaSU aktif)"
+        required: true
+        default: "main"
+      droidspaces:
+        description: "Opsi kernel Droidspaces + patch cgroup"
+        type: boolean
+        required: true
+        default: true
+      systemd_backports:
+        description: "Backport systemd 260+ (butuh Droidspaces, ikut aktif otomatis)"
+        type: boolean
+        required: true
+        default: true
+      anland:
+        description: "Kompatibilitas Anland (butuh Droidspaces, ikut aktif otomatis)"
+        type: boolean
+        required: true
+        default: true
+      lto:
+        description: "stock = ThinLTO + CFI seperti defconfig stone. off = mati (lebih cepat, untuk melacak error link)"
+        type: choice
+        required: true
+        default: "stock"
+        options:
+          - stock
+          - "off"
+      localversion:
+        description: "Akhiran versi kernel di uname -r setelah 5.4.x-qgki (kosongkan agar sama dengan stok)"
+        required: false
+        default: "-stone-ci"
+      extra_config:
+        description: "Opsi config tambahan, pisah spasi/koma. Contoh: DRM_VGEM=y CGROUP_NET_PRIO=y KSU_DEBUG=n"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ARCH: arm64
+      # Input string/boolean dilewatkan lewat env, tidak ditempel langsung ke script.
+      IN_BAKASU: ${{ inputs.bakasu }}
+      IN_DROIDSPACES: ${{ inputs.droidspaces }}
+      IN_SYSTEMD: ${{ inputs.systemd_backports }}
+      IN_ANLAND: ${{ inputs.anland }}
+      BAKASU_REF: ${{ inputs.bakasu_ref }}
+      LTO: ${{ inputs.lto }}
+      LOCALVERSION_SUFFIX: ${{ inputs.localversion }}
+      EXTRA_CONFIG: ${{ inputs.extra_config }}
+
+    steps:
+      - name: Checkout CI files (repo ini)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      # Repo publik jalan dengan token bawaan. Untuk fork kernel PRIVAT, tambahkan
+      # secret KERNEL_REPO_TOKEN (PAT dengan akses baca ke repo itu).
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          token: ${{ secrets.KERNEL_REPO_TOKEN || github.token }}
+          path: kernel
+
+      # Source + hasil build + LTO butuh banyak ruang; runner hanya menyisakan ~14 GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm flex bison bc cpio zip xz-utils python3 git curl \
+            libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+          clang --version | head -n1
+
+      - name: Resolve features
+        run: |
+          set -eu
+          list=""
+          [ "$IN_DROIDSPACES" = "true" ] && list="$list droidspaces"
+          [ "$IN_SYSTEMD" = "true" ]     && list="$list systemd"
+          [ "$IN_ANLAND" = "true" ]      && list="$list anland"
+          [ "$IN_BAKASU" = "true" ]      && list="$list bakasu"
+          . ci/scripts/lib.sh
+          FEATURES=$(resolve_features "$list" | tr '\n' ' ' | sed 's/ *$//')
+          echo "FEATURES=${FEATURES}" >> "$GITHUB_ENV"
+          echo "Fitur aktif: ${FEATURES:-(tidak ada, build stok)}"
+
+      - name: Prepare kernel tree (setup + patches)
+        run: ci/scripts/prepare-tree.sh kernel
+
+      - name: Configure kernel
+        run: ci/scripts/make-config.sh kernel
+
+      - name: Verify final .config
+        run: ci/scripts/verify-config.sh kernel
+
+      - name: Build Image
+        run: ci/scripts/build.sh kernel "$GITHUB_WORKSPACE/build.log"
+
+      - name: Summarize compile errors
+        if: failure()
+        run: |
+          echo "### Compile errors" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E ' error: |\*\*\* \[|ld.lld: error' build.log | sort -u | head -n 60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -eu
+          ZIP=$(ci/scripts/package.sh kernel "$GITHUB_WORKSPACE" | tail -n1)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          {
+            echo "### Hasil build"
+            echo "- Zip: \`$ZIP\`"
+            echo "- Kernel: \`$(cat kernel/out/include/config/kernel.release)\`"
+            echo "- Fitur: ${FEATURES:-stok}"
+            echo "- LTO: $LTO"
+            [ -d kernel/KernelSU ] && echo "- BakaSU: $(git -C kernel/KernelSU log -1 --format='%h %s')"
+            echo "- Kernel commit: $(git -C kernel log -1 --format='%h %s')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: stone-kernel-zip
+          path: ${{ env.ZIP }}
+
+      - name: Upload build log and .config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-and-config
+          # kernel/out/.config adalah file tersembunyi; upload-artifact melewatinya secara default.
+          include-hidden-files: true
+          path: |
+            build.log
+            kernel/out/.config
+          if-no-files-found: ignore
