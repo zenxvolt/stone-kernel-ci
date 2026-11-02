@@ -66,7 +66,7 @@ jobs:
       MOD_ANLAND: ${{ inputs.mod_anland }}
       BAKASU_REF: ${{ inputs.bakasu_ref }}
       DEFCONFIG: ${{ inputs.defconfig }}
-      DISABLE_LTO: ${{ inputs.disable_lto }}
+      CI_DISABLE_LTO: ${{ inputs.disable_lto }}
       CLANG_URL: ${{ inputs.clang_url }}
       VERSION_SUFFIX: "-ci"
       CI_META_DIR: ${{ github.workspace }}/meta
@@ -141,7 +141,7 @@ jobs:
         run: |
           set -eux
           EXTRA=()
-          if [ "$DISABLE_LTO" = "true" ]; then EXTRA+=( "$GITHUB_WORKSPACE/ci/configs/no-lto.config" ); fi
+          if [ "$CI_DISABLE_LTO" = "true" ]; then EXTRA+=( "$GITHUB_WORKSPACE/ci/configs/no-lto.config" ); fi
           bash ci/scripts/configure.sh kernel "$DEFCONFIG" "${EXTRA[@]}"
 
       - name: Verify final .config
@@ -178,7 +178,7 @@ jobs:
             echo "modules: $MODS"
             echo "kernel: $(make -s -C kernel kernelversion)  defconfig: $DEFCONFIG"
             echo "kernel commit: $(git -C kernel rev-parse --short HEAD)"
-            echo "lto disabled: $DISABLE_LTO"
+            echo "lto disabled: $CI_DISABLE_LTO"
             echo "clang: $(clang --version | head -n1)"
           } > AnyKernel3/build-info.txt
           TAG="$(paste -sd- meta/selected.txt)"
