@@ -1,0 +1,22 @@
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index d47db8680..ffa66fe98 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -4105,6 +4105,17 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
+ 		spin_unlock_irq(&cgroup_file_kn_lock);
+ 	}
+ 
++	/*
++	 * Droidspaces/LXC: on a NOPREFIX (v1) hierarchy also expose the
++	 * "<subsys>.<file>" name as a link, as older kernels did.
++	 */
++	if (cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX) &&
++	    !(cft->flags & CFTYPE_NO_PREFIX)) {
++		snprintf(name, CGROUP_FILE_NAME_MAX, "%s.%s",
++			 cft->ss->legacy_name, cft->name);
++		kernfs_create_link(cgrp->kn, name, kn);
++	}
++
+ 	return 0;
+ }
+ 

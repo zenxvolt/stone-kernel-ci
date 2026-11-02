@@ -1,0 +1,6 @@
+# Urutan penerapan modul (patch + fragment config).
+# Modul baru: buat folder modules/<nama>/ lalu tambahkan namanya di sini.
+bakasu
+droidspaces
+systemd
+anland

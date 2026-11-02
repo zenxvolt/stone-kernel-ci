@@ -1,80 +1,75 @@
-name: Build kernel (stone - modular)
+name: Build kernel (stone, modular)
 
-# Repo CI mandiri: TIDAK berada di dalam repo kernel. Workflow meng-checkout source
-# kernel (upstream atau fork kamu), menerapkan fitur yang dipilih di bawah
-# (features/<nama>/), membangun Image, lalu membuat zip AnyKernel3 yang bisa
-# di-flash. Semua logika ada di scripts/, workflow ini hanya mengurutkan langkahnya.
+# Repo CI mandiri: TIDAK berada di dalam repo kernel. Workflow mengambil source
+# kernel (upstream atau fork kamu), menerapkan modul yang kamu centang
+# (patch + fragment config), membangun Image, lalu membuat zip AnyKernel3.
+# Menambah modul baru: lihat README bagian "Menambah modul".
 
 on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: "Repo kernel (owner/nama). Upstream atau fork kamu."
+        description: "Repo kernel (owner/name). Upstream atau fork kamu."
         required: true
         default: "crdroidandroid/android_kernel_xiaomi_stone"
       kernel_branch:
-        description: "Branch kernel (16.0 = Android 16)"
+        description: "Branch kernel (upstream stone saat ini hanya punya 16.0)"
         required: true
         default: "16.0"
-      bakasu:
-        description: "BakaSU root (manual hook, tanpa SUSFS)"
+      defconfig:
+        description: "Defconfig dasar"
+        required: true
+        default: "moonstone_defconfig"
+      mod_bakasu:
+        description: "Modul bakasu: root BakaSU (manual hook, tanpa SUSFS)"
+        type: boolean
+        required: true
+        default: true
+      mod_droidspaces:
+        description: "Modul droidspaces: opsi kernel container + link cgroup NOPREFIX"
+        type: boolean
+        required: true
+        default: true
+      mod_systemd:
+        description: "Modul systemd: backport kernel untuk guest systemd 260+"
+        type: boolean
+        required: true
+        default: true
+      mod_anland:
+        description: "Modul anland: DRM vgem + kcmp untuk Anland (Wayland)"
         type: boolean
         required: true
         default: true
       bakasu_ref:
-        description: "Branch atau tag BakaSU (dipakai kalau BakaSU aktif)"
+        description: "Branch/tag/commit BakaSU (dipakai modul bakasu)"
         required: true
         default: "main"
-      droidspaces:
-        description: "Opsi kernel Droidspaces + patch cgroup"
+      disable_lto:
+        description: "Matikan LTO/CFI/ShadowCallStack (wajib untuk clang bawaan Ubuntu)"
         type: boolean
         required: true
         default: true
-      systemd_backports:
-        description: "Backport systemd 260+ (butuh Droidspaces, ikut aktif otomatis)"
-        type: boolean
-        required: true
-        default: true
-      anland:
-        description: "Kompatibilitas Anland (butuh Droidspaces, ikut aktif otomatis)"
-        type: boolean
-        required: true
-        default: true
-      lto:
-        description: "stock = ThinLTO + CFI seperti defconfig stone. off = mati (lebih cepat, untuk melacak error link)"
-        type: choice
-        required: true
-        default: "stock"
-        options:
-          - stock
-          - "off"
-      localversion:
-        description: "Akhiran versi kernel di uname -r setelah 5.4.x-qgki (kosongkan agar sama dengan stok)"
-        required: false
-        default: "-stone-ci"
-      extra_config:
-        description: "Opsi config tambahan, pisah spasi/koma. Contoh: DRM_VGEM=y CGROUP_NET_PRIO=y KSU_DEBUG=n"
+      clang_url:
+        description: "Opsional: URL tarball toolchain clang (AOSP/Neutron/...). Kosong = clang apt."
         required: false
         default: ""
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 180
     env:
       ARCH: arm64
-      # Input string/boolean dilewatkan lewat env, tidak ditempel langsung ke script.
-      IN_BAKASU: ${{ inputs.bakasu }}
-      IN_DROIDSPACES: ${{ inputs.droidspaces }}
-      IN_SYSTEMD: ${{ inputs.systemd_backports }}
-      IN_ANLAND: ${{ inputs.anland }}
+      MOD_BAKASU: ${{ inputs.mod_bakasu }}
+      MOD_DROIDSPACES: ${{ inputs.mod_droidspaces }}
+      MOD_SYSTEMD: ${{ inputs.mod_systemd }}
+      MOD_ANLAND: ${{ inputs.mod_anland }}
       BAKASU_REF: ${{ inputs.bakasu_ref }}
-      LTO: ${{ inputs.lto }}
-      LOCALVERSION_SUFFIX: ${{ inputs.localversion }}
-      EXTRA_CONFIG: ${{ inputs.extra_config }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      DISABLE_LTO: ${{ inputs.disable_lto }}
+      CLANG_URL: ${{ inputs.clang_url }}
+      VERSION_SUFFIX: "-ci"
+      CI_META_DIR: ${{ github.workspace }}/meta
 
     steps:
       - name: Checkout CI files (repo ini)
@@ -82,8 +77,8 @@ jobs:
         with:
           path: ci
 
-      # Repo publik jalan dengan token bawaan. Untuk fork kernel PRIVAT, tambahkan
-      # secret KERNEL_REPO_TOKEN (PAT dengan akses baca ke repo itu).
+      # Repo publik cukup dengan token bawaan. Untuk fork PRIVAT, tambahkan secret
+      # KERNEL_REPO_TOKEN (PAT dengan akses baca).
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
@@ -92,82 +87,104 @@ jobs:
           token: ${{ secrets.KERNEL_REPO_TOKEN || github.token }}
           path: kernel
 
-      # Semua log langkah penting ditulis ke logs/ dan di-upload di akhir (if: always()),
-      # jadi artifact berisi log meskipun build gagal di tahap awal.
-      - name: Create log folder
-        run: mkdir -p logs
-
-      # Source + hasil build + LTO butuh banyak ruang; runner hanya menyisakan ~14 GB.
-      - name: Free disk space
-        run: |
-          {
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          } 2>&1 | tee logs/00-setup.log
-
       - name: Install build dependencies
         run: |
-          {
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
-              clang lld llvm flex bison bc cpio zip xz-utils python3 git curl \
-              libssl-dev libelf-dev \
-              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
-            clang --version | head -n1
-          } 2>&1 | tee -a logs/00-setup.log
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm flex bison bc cpio zip xz-utils zstd python3 git curl \
+            libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
 
-      - name: Resolve features
+      - name: Custom clang toolchain (opsional)
+        if: ${{ inputs.clang_url != '' }}
         run: |
-          set -eu
-          list=""
-          [ "$IN_DROIDSPACES" = "true" ] && list="$list droidspaces"
-          [ "$IN_SYSTEMD" = "true" ]     && list="$list systemd"
-          [ "$IN_ANLAND" = "true" ]      && list="$list anland"
-          [ "$IN_BAKASU" = "true" ]      && list="$list bakasu"
-          . ci/scripts/lib.sh
-          FEATURES=$(resolve_features "$list" | tr '\n' ' ' | sed 's/ *$//')
-          echo "FEATURES=${FEATURES}" >> "$GITHUB_ENV"
-          echo "Fitur aktif: ${FEATURES:-(tidak ada, build stok)}" | tee logs/05-features.log
+          set -eux
+          mkdir -p "$HOME/toolchain"
+          curl -fsSL "$CLANG_URL" | tar -xf - -C "$HOME/toolchain"
+          CLANG_BIN="$(find "$HOME/toolchain" -type f -name clang -path '*/bin/clang' | head -n1)"
+          test -n "$CLANG_BIN"
+          echo "$(dirname "$CLANG_BIN")" >> "$GITHUB_PATH"
 
-      # Skrip dipanggil lewat `bash`, jadi tidak bergantung pada bit eksekusi file
-      # (bit itu hilang kalau repo diunggah lewat web atau zip).
-      - name: Prepare kernel tree (setup + patches)
-        run: bash ci/scripts/prepare-tree.sh kernel 2>&1 | tee logs/10-prepare.log
+      - name: Show toolchain
+        run: clang --version | head -n1
 
-      - name: Configure kernel
-        run: bash ci/scripts/make-config.sh kernel 2>&1 | tee logs/20-config.log
-
-      - name: Verify final .config
-        run: bash ci/scripts/verify-config.sh kernel 2>&1 | tee logs/30-verify.log
-
-      - name: Build Image
-        run: bash ci/scripts/build.sh kernel "$GITHUB_WORKSPACE/logs/40-build.log"
-
-      - name: Summarize errors
-        if: failure()
+      - name: Select modules
         run: |
+          MODS=""
+          add() { if [ "$2" = "true" ]; then MODS="${MODS:+$MODS,}$1"; fi; }
+          add bakasu      "$MOD_BAKASU"
+          add droidspaces "$MOD_DROIDSPACES"
+          add systemd     "$MOD_SYSTEMD"
+          add anland      "$MOD_ANLAND"
+          echo "MODS=${MODS:-none}" >> "$GITHUB_ENV"
+
+      - name: Apply modules (patches + config fragments)
+        run: |
+          set -o pipefail
+          bash ci/scripts/apply-modules.sh kernel "$MODS" 2>&1 | tee "$RUNNER_TEMP/apply.log"
           {
-            echo "### Error ringkas (detail lengkap ada di artifact build-log-and-config)"
+            echo "### Modul aktif: \`$MODS\`"
             echo '```'
-            grep -h -E '::error::|::warning::| error: |\*\*\* \[|ld\.lld: error|does not apply|Permission denied|No such file|not found' logs/*.log 2>/dev/null | sort -u | head -n 60 || true
+            grep -E '^(==|applied|present|skip)' "$RUNNER_TEMP/apply.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Shorten kernel version string
+        working-directory: kernel
+        run: |
+          # LOCALVERSION_AUTO menambah "-g<hash>-dirty" (tree dirty setelah patch) dan
+          # bisa melewati batas 64 karakter. .scmversion menimpanya.
+          printf -- '%s' "$VERSION_SUFFIX" > .scmversion
+
+      - name: Configure kernel
+        run: |
+          set -eux
+          EXTRA=()
+          if [ "$DISABLE_LTO" = "true" ]; then EXTRA+=( "$GITHUB_WORKSPACE/ci/configs/no-lto.config" ); fi
+          bash ci/scripts/configure.sh kernel "$DEFCONFIG" "${EXTRA[@]}"
+
+      - name: Verify final .config
+        run: bash ci/scripts/verify-config.sh kernel/out/.config
+
+      - name: Build Image
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          . "$GITHUB_WORKSPACE/ci/scripts/env.sh"
+          # BakaSU meng-include security/selinux/flask.h dan generated/compile.h tanpa
+          # mendeklarasikannya sebagai dependency: generate dulu agar tidak race.
+          kmake security/selinux/ init/version.o 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          # -k: lanjut setelah error agar SATU run menampilkan semua file yang gagal.
+          kmake -k -j"$(nproc)" Image 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          ls -l out/arch/arm64/boot/Image
+
+      - name: Summarize compile errors
+        if: failure()
+        run: |
+          echo "### Compile errors" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E ' error: |\*\*\* \[|manual_hook|You lost' build.log | sort -u | head -n 60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package AnyKernel3 zip
         run: |
-          set -eu
-          ZIP=$(bash ci/scripts/package.sh kernel "$GITHUB_WORKSPACE" | tail -n1)
-          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          set -eux
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
+          cp ci/anykernel/anykernel.sh AnyKernel3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
           {
-            echo "### Hasil build"
-            echo "- Zip: \`$ZIP\`"
-            echo "- Kernel: \`$(cat kernel/out/include/config/kernel.release)\`"
-            echo "- Fitur: ${FEATURES:-stok}"
-            echo "- LTO: $LTO"
-            [ -d kernel/KernelSU ] && echo "- BakaSU: $(git -C kernel/KernelSU log -1 --format='%h %s')"
-            echo "- Kernel commit: $(git -C kernel log -1 --format='%h %s')"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "modules: $MODS"
+            echo "kernel: $(make -s -C kernel kernelversion)  defconfig: $DEFCONFIG"
+            echo "kernel commit: $(git -C kernel rev-parse --short HEAD)"
+            echo "lto disabled: $DISABLE_LTO"
+            echo "clang: $(clang --version | head -n1)"
+          } > AnyKernel3/build-info.txt
+          TAG="$(paste -sd- meta/selected.txt)"
+          ZIP="stone-${TAG:-stock}-$(date +%Y%m%d-%H%M).zip"
+          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP" . -x '*.placeholder')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
@@ -175,7 +192,7 @@ jobs:
           name: stone-kernel-zip
           path: ${{ env.ZIP }}
 
-      - name: Upload logs and .config
+      - name: Upload build log and .config
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -183,6 +200,6 @@ jobs:
           # kernel/out/.config adalah file tersembunyi; upload-artifact melewatinya secara default.
           include-hidden-files: true
           path: |
-            logs/
+            build.log
             kernel/out/.config
           if-no-files-found: ignore
