@@ -61,6 +61,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
     env:
       ARCH: arm64
       # Input string/boolean dilewatkan lewat env, tidak ditempel langsung ke script.
@@ -89,21 +92,30 @@ jobs:
           token: ${{ secrets.KERNEL_REPO_TOKEN || github.token }}
           path: kernel
 
+      # Semua log langkah penting ditulis ke logs/ dan di-upload di akhir (if: always()),
+      # jadi artifact berisi log meskipun build gagal di tahap awal.
+      - name: Create log folder
+        run: mkdir -p logs
+
       # Source + hasil build + LTO butuh banyak ruang; runner hanya menyisakan ~14 GB.
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          {
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          } 2>&1 | tee logs/00-setup.log
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm flex bison bc cpio zip xz-utils python3 git curl \
-            libssl-dev libelf-dev \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
-          clang --version | head -n1
+          {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              clang lld llvm flex bison bc cpio zip xz-utils python3 git curl \
+              libssl-dev libelf-dev \
+              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+              gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+            clang --version | head -n1
+          } 2>&1 | tee -a logs/00-setup.log
 
       - name: Resolve features
         run: |
@@ -116,32 +128,36 @@ jobs:
           . ci/scripts/lib.sh
           FEATURES=$(resolve_features "$list" | tr '\n' ' ' | sed 's/ *$//')
           echo "FEATURES=${FEATURES}" >> "$GITHUB_ENV"
-          echo "Fitur aktif: ${FEATURES:-(tidak ada, build stok)}"
+          echo "Fitur aktif: ${FEATURES:-(tidak ada, build stok)}" | tee logs/05-features.log
 
+      # Skrip dipanggil lewat `bash`, jadi tidak bergantung pada bit eksekusi file
+      # (bit itu hilang kalau repo diunggah lewat web atau zip).
       - name: Prepare kernel tree (setup + patches)
-        run: ci/scripts/prepare-tree.sh kernel
+        run: bash ci/scripts/prepare-tree.sh kernel 2>&1 | tee logs/10-prepare.log
 
       - name: Configure kernel
-        run: ci/scripts/make-config.sh kernel
+        run: bash ci/scripts/make-config.sh kernel 2>&1 | tee logs/20-config.log
 
       - name: Verify final .config
-        run: ci/scripts/verify-config.sh kernel
+        run: bash ci/scripts/verify-config.sh kernel 2>&1 | tee logs/30-verify.log
 
       - name: Build Image
-        run: ci/scripts/build.sh kernel "$GITHUB_WORKSPACE/build.log"
+        run: bash ci/scripts/build.sh kernel "$GITHUB_WORKSPACE/logs/40-build.log"
 
-      - name: Summarize compile errors
+      - name: Summarize errors
         if: failure()
         run: |
-          echo "### Compile errors" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E ' error: |\*\*\* \[|ld.lld: error' build.log | sort -u | head -n 60 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Error ringkas (detail lengkap ada di artifact build-log-and-config)"
+            echo '```'
+            grep -h -E '::error::|::warning::| error: |\*\*\* \[|ld\.lld: error|does not apply|Permission denied|No such file|not found' logs/*.log 2>/dev/null | sort -u | head -n 60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package AnyKernel3 zip
         run: |
           set -eu
-          ZIP=$(ci/scripts/package.sh kernel "$GITHUB_WORKSPACE" | tail -n1)
+          ZIP=$(bash ci/scripts/package.sh kernel "$GITHUB_WORKSPACE" | tail -n1)
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
           {
             echo "### Hasil build"
@@ -159,7 +175,7 @@ jobs:
           name: stone-kernel-zip
           path: ${{ env.ZIP }}
 
-      - name: Upload build log and .config
+      - name: Upload logs and .config
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -167,6 +183,6 @@ jobs:
           # kernel/out/.config adalah file tersembunyi; upload-artifact melewatinya secara default.
           include-hidden-files: true
           path: |
-            build.log
+            logs/
             kernel/out/.config
           if-no-files-found: ignore
