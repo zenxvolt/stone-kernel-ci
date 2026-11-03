@@ -51,8 +51,11 @@ on:
         type: boolean
         default: false
       clang_url:
-        description: "Clang tarball (AOSP prebuilt; LTO/CFI need clang >= 10)"
-        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
+        description: "Clang toolchain: git repo URL (shallow clone) or .tar.gz URL with bin/ at its root. AOSP clang, LTO/CFI need >= 10"
+        default: "https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b"
+      clang_ref:
+        description: "Branch / tag of clang_url when it is a git repo (ignored for .tar.gz)"
+        default: "lineage-20.0"
       publish_release:
         description: "Publish the flashable zip as a GitHub release"
         type: boolean
@@ -97,19 +100,55 @@ jobs:
           sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio zip lz4 zstd \
             python3 curl git gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi device-tree-compiler
 
+      # restore + save are split on purpose: the plain actions/cache only saves when the
+      # whole job succeeds, so a failure in a later step would throw the ~1 GB toolchain away.
       - name: Restore toolchain cache
         id: tc-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: toolchain
-          key: clang-${{ hashFiles('.github/workflows/build-stone.yml') }}-${{ inputs.clang_url }}
+          key: clang-v2-${{ inputs.clang_url }}@${{ inputs.clang_ref }}
 
       - name: Download toolchain
         if: steps.tc-cache.outputs.cache-hit != 'true'
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+          CLANG_REF: ${{ inputs.clang_ref }}
         run: |
-          mkdir -p toolchain
-          curl -fL --retry 3 "${{ inputs.clang_url }}" | tar -xz -C toolchain
-          toolchain/bin/clang --version | head -1
+          set -euo pipefail
+          rm -rf toolchain
+          case "$CLANG_URL" in
+            *.tar.gz|*.tgz)
+              # To a file first, then verify: `curl | tar` turns any dropped connection into
+              # "gzip: unexpected end of file", and a curl retry would append to a half-fed pipe.
+              # (android.googlesource.com +archive of a whole clang dir gets cut off mid-stream.)
+              curl -fL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o clang.tgz "$CLANG_URL"
+              tar -tzf clang.tgz > /dev/null
+              mkdir -p toolchain
+              tar -xzf clang.tgz -C toolchain
+              rm -f clang.tgz ;;
+            *)
+              ok=0
+              for i in 1 2 3; do
+                if git clone --depth 1 --branch "$CLANG_REF" "$CLANG_URL" toolchain; then ok=1; break; fi
+                echo "git clone failed (attempt $i/3)"; rm -rf toolchain; sleep 15
+              done
+              [ "$ok" = 1 ]
+              rm -rf toolchain/.git ;;
+          esac
+          if [ ! -x toolchain/bin/clang ]; then
+            echo "::error::toolchain/bin/clang not found. The archive/repo must have bin/ at its root."
+            ls -la toolchain | head -20; exit 1
+          fi
+          toolchain/bin/clang --version | sed -n 1p
+          toolchain/bin/ld.lld --version | sed -n 1p
+
+      - name: Save toolchain cache
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchain
+          key: ${{ steps.tc-cache.outputs.cache-primary-key }}
 
       - name: Prepare source tree
         if: matrix.variant == 'custom'
