@@ -1,0 +1,267 @@
+name: Build stone kernel
+
+# Poco X5 5G (stone / moonstone_defconfig, Linux 5.4 QGKI)
+# Features are modular: every block below can be switched on/off per run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel source repo (owner/name)"
+        default: "crdroidandroid/android_kernel_xiaomi_stone"
+      kernel_ref:
+        description: "Branch / tag / commit. Use the one your ROM's kernel was built from"
+        default: "16.0"
+      defconfig:
+        description: "Defconfig"
+        default: "moonstone_defconfig"
+      expected_release:
+        description: "Optional: `uname -r` of the kernel you run now. Build fails if the new release string differs (modules check it)"
+        default: ""
+      enable_bakasu:
+        description: "BakaSU root (manual hook)"
+        type: boolean
+        default: true
+      bakasu_ref:
+        description: "BakaSU branch / tag / commit"
+        default: "main"
+      enable_droidspaces:
+        description: "Droidspaces options + kABI padding patches"
+        type: boolean
+        default: true
+      kabi_variant:
+        description: "task_struct padding slots for SYSVIPC (try another one if the device stalls)"
+        type: choice
+        options: ["6_7_8", "3_4_5", "1_2_3"]
+        default: "6_7_8"
+      enable_network:
+        description: "macvlan + IPv6 NAT (NAT66)"
+        type: boolean
+        default: true
+      enable_systemd:
+        description: "Backports for systemd 258+ (statx, utimensat, faccessat2) + FHANDLE"
+        type: boolean
+        default: true
+      enable_firewall:
+        description: "UFW / Fail2Ban options (needs Droidspaces on)"
+        type: boolean
+        default: false
+      abi_check:
+        description: "Also build the untouched defconfig and diff exported-symbol CRCs (about 2x build time)"
+        type: boolean
+        default: false
+      clang_url:
+        description: "Clang tarball (AOSP prebuilt; LTO/CFI need clang >= 10)"
+        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
+      publish_release:
+        description: "Publish the flashable zip as a GitHub release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  ARCH: arm64
+
+jobs:
+  build:
+    name: build (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.abi_check && '["custom","baseline"]' || '["custom"]') }}
+    steps:
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio zip lz4 zstd \
+            python3 curl git gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi device-tree-compiler
+
+      - name: Restore toolchain cache
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: clang-${{ hashFiles('.github/workflows/build-stone.yml') }}-${{ inputs.clang_url }}
+
+      - name: Download toolchain
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain
+          curl -fL --retry 3 "${{ inputs.clang_url }}" | tar -xz -C toolchain
+          toolchain/bin/clang --version | head -1
+
+      - name: Prepare source tree
+        if: matrix.variant == 'custom'
+        env:
+          ENABLE_BACKPORTS: ${{ inputs.enable_systemd && 1 || 0 }}
+          ENABLE_SYSTEMD: ${{ inputs.enable_systemd && 1 || 0 }}
+          ENABLE_DROIDSPACES: ${{ inputs.enable_droidspaces && 1 || 0 }}
+          ENABLE_FIREWALL: ${{ inputs.enable_firewall && 1 || 0 }}
+          ENABLE_NETWORK: ${{ inputs.enable_network && 1 || 0 }}
+          ENABLE_BAKASU: ${{ inputs.enable_bakasu && 1 || 0 }}
+          KABI_VARIANT: ${{ inputs.kabi_variant }}
+          BAKASU_REF: ${{ inputs.bakasu_ref }}
+        run: |
+          ./scripts/prepare_tree.sh kernel | tee prepare.log
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          KMAKE="$GITHUB_WORKSPACE/scripts/kmake.sh"
+          "$KMAKE" "${{ inputs.defconfig }}"
+          FRAGS=$(grep -v '^$' .ci-frags 2>/dev/null || true)
+          if [ -n "$FRAGS" ]; then
+            scripts/kconfig/merge_config.sh -m -O out out/.config $FRAGS
+            "$KMAKE" olddefconfig
+            "$GITHUB_WORKSPACE/scripts/verify_config.sh" out/.config $FRAGS
+          else
+            "$KMAKE" olddefconfig
+          fi
+          # LTO/CFI/SCS are silently dropped when the compiler probe fails, which
+          # makes the stock vendor modules fail later. Stop here instead.
+          for o in LTO_CLANG CFI_CLANG SHADOW_CALL_STACK; do
+            if grep -q "^CONFIG_$o=y" "arch/arm64/configs/${{ inputs.defconfig }}" && ! grep -q "^CONFIG_$o=y" out/.config; then
+              echo "::error::CONFIG_$o was dropped by Kconfig (toolchain probe failed)"; exit 1
+            fi
+          done
+          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS)' out/.config
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          TARGETS=(Image)
+          # Module.symvers (needed by the ABI diff) only exists after `modules`
+          if [ "${{ inputs.abi_check }}" = "true" ]; then TARGETS+=(modules); fi
+          set -o pipefail
+          "$GITHUB_WORKSPACE/scripts/kmake.sh" -j"$(nproc)" "${TARGETS[@]}" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
+          test -f out/arch/arm64/boot/Image
+          echo "KERNEL_RELEASE=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Check kernel release string
+        run: |
+          echo "kernel.release = $KERNEL_RELEASE"
+          want="${{ inputs.expected_release }}"
+          if [ -n "$want" ] && [ "$want" != "$KERNEL_RELEASE" ]; then
+            echo "::error::release '$KERNEL_RELEASE' != expected '$want'. Modules compare vermagic, so they would all be rejected."
+            exit 1
+          fi
+
+      - name: Package AnyKernel3 zip
+        if: matrix.variant == 'custom'
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE ak3/modules ak3/patch ak3/ramdisk
+          mkdir -p ak3/modules ak3/patch ak3/ramdisk
+          cp anykernel/anykernel.sh ak3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image ak3/Image
+          feats=""
+          [ "${{ inputs.enable_bakasu }}" = true ]      && feats="$feats BakaSU"
+          [ "${{ inputs.enable_droidspaces }}" = true ] && feats="$feats Droidspaces"
+          [ "${{ inputs.enable_network }}" = true ]     && feats="$feats macvlan+IPv6"
+          [ "${{ inputs.enable_systemd }}" = true ]     && feats="$feats systemd-backports"
+          sed -i "s|__KERNEL_STRING__|stone ${KERNEL_RELEASE} -${feats}|" ak3/anykernel.sh
+          ZIP="stone-${KERNEL_RELEASE}-$(date -u +%Y%m%d-%H%M)-run${{ github.run_number }}.zip"
+          (cd ak3 && zip -r9q "../$ZIP" . -x '*.git*')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+
+      - name: Release notes
+        if: matrix.variant == 'custom'
+        run: |
+          {
+            echo "kernel: ${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}  ($KERNEL_RELEASE)"
+            echo "defconfig: ${{ inputs.defconfig }}"
+            echo "clang: $(toolchain/bin/clang --version | head -1)"
+            echo "features: bakasu=${{ inputs.enable_bakasu }} droidspaces=${{ inputs.enable_droidspaces }} (kabi ${{ inputs.kabi_variant }}) network=${{ inputs.enable_network }} systemd=${{ inputs.enable_systemd }} firewall=${{ inputs.enable_firewall }}"
+            grep -E '^BakaSU commit' prepare.log || true
+            echo
+            echo "Install the BakaSU manager built from the SAME commit (kernel and ksud must agree on the UAPI version)."
+          } | tee notes.txt
+
+      - name: Upload zip
+        if: matrix.variant == 'custom'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stone-kernel-zip
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+            notes.txt
+            prepare.log
+
+      - name: Upload Module.symvers
+        if: inputs.abi_check
+        uses: actions/upload-artifact@v4
+        with:
+          name: symvers-${{ matrix.variant }}
+          path: kernel/out/Module.symvers
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.variant }}
+          path: |
+            build.log
+            prepare.log
+            kernel/out/.config
+
+  abi-report:
+    name: ABI report
+    needs: build
+    if: inputs.abi_check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: symvers-*
+          path: symvers
+      - name: Diff exported symbol CRCs
+        run: |
+          ./scripts/abi_diff.sh symvers/symvers-baseline/Module.symvers \
+                                symvers/symvers-custom/Module.symvers abi-report.md \
+            || echo "::warning::exported symbol CRCs changed, see abi-report.md"
+          cat abi-report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abi-report
+          path: abi-report.md
+
+  release:
+    name: Publish release
+    needs: build
+    if: inputs.publish_release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stone-kernel-zip
+          path: out
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stone-run${{ github.run_number }}
+          name: stone kernel run ${{ github.run_number }}
+          body_path: out/notes.txt
+          files: |
+            out/*.zip
+            out/*.sha256

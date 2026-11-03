@@ -1,80 +1,38 @@
 # stone-kernel-ci
 
-CI untuk membangun kernel crDroid `stone` (Redmi Note 12 5G / POCO X5 5G, SM6375, Linux 5.4.302)
-dengan fitur custom yang **bisa dipilih satu per satu**: root BakaSU, opsi kernel Droidspaces,
-backport systemd, dan kompatibilitas Anland.
+Build kernel Poco X5 5G (`moonstone_defconfig`, Linux 5.4 QGKI) di GitHub Actions dengan fitur modular:
 
-Repo ini tidak berisi kode kernel. Workflow mengambil kernel dari repo lain (upstream atau fork
-kamu), menerapkan modul yang dicentang, membangun `Image`, lalu membuat zip AnyKernel3.
-Turunan dari `rova-kernel-ci`, disesuaikan untuk kernel 5.4.
+| Fitur (input workflow) | Isi |
+|---|---|
+| `enable_bakasu` | BakaSU root, mode **manual hook** (tracepoint hook hanya untuk GKI 5.10+). 6 hook disisipkan otomatis oleh `scripts/bakasu_hooks.py`. |
+| `enable_droidspaces` | Opsi kernel Droidspaces + patch kABI (SYSVIPC/mqueue dipindah ke padding `ANDROID_KABI_*`) supaya CRC symbol tidak berubah. |
+| `enable_network` | `MACVLAN`, `IP6_NF_NAT`, `IP6_NF_TARGET_MASQUERADE` (+ guard IPv6 dan driver USB-Ethernet yang sudah aktif). |
+| `enable_systemd` | Backport untuk systemd 258+ (statx mnt_id/mount_root, utimensat, faccessat2) + `FHANDLE`. `close_range` sudah ada di tree stone, jadi hanya patch 1 sampai 4. |
+| `enable_firewall` | Opsi UFW / Fail2Ban (opsional). |
+| `abi_check` | Build ulang defconfig polos dan bandingkan CRC symbol export. Dua kali waktu build. |
 
-## Pakai
-1. Tab **Actions** -> *Build kernel (stone, modular)* -> **Run workflow**.
-2. Isi `kernel_repo` dan `kernel_branch`. Upstream stone saat ini hanya punya branch `16.0`
-   (tidak ada `15.0`); kalau kamu punya fork dengan branch Android 15, isi di sini.
-3. Centang modul yang mau dipakai (semua aktif secara default).
-4. Unduh artifact `stone-kernel-zip`, backup boot, lalu flash lewat recovery.
-   Isi zip juga memuat `build-info.txt` (modul, commit, clang).
+## Cara pakai
 
-Fork privat: tambahkan secret `KERNEL_REPO_TOKEN` (PAT dengan akses baca).
+1. Buat repo `stone-kernel-ci`, push isi folder ini.
+2. Actions → **Build stone kernel** → Run workflow.
+3. Isi `kernel_ref` dengan branch yang sama dengan kernel ROM kamu sekarang.
+4. Isi `expected_release` dengan output `uname -r` dari HP (build gagal lebih awal kalau beda).
+5. Unduh artifact `stone-kernel-zip`, flash lewat Kernel Flasher / recovery.
+6. Pasang manager BakaSU dari **commit yang sama** (commit tercetak di `notes.txt`).
 
-## Modul
-| Modul | Isi | Catatan |
-|---|---|---|
-| `bakasu` | patch hook manual BakaSU (`exec`, `faccessat`, `stat`, `newfstat`, `fstat64`, `reboot`) + setup BakaSU + `CONFIG_KSU*` | stone tidak punya KernelSU bawaan, jadi patch hook ditulis ulang untuk 5.4 (rova hanya mengubah hook statis yang sudah ada) |
-| `droidspaces` | opsi namespace, cgroup, veth/bridge, NAT, macvlan, IPv6/NAT66 + patch link cgroup NOPREFIX | patch cgroup di-port ke 5.4 (`legacy_name`) |
-| `systemd` | backport VFS untuk guest systemd 260+ dan `FHANDLE`, `AUTOFS_FS`, `CRYPTO_USER_API_HASH` | hanya patch yang belum ada di tree; stone sudah punya `close_range`, jadi 0005 dan 0006 otomatis dilewati |
-| `anland` | `DRM_VGEM` + `CHECKPOINT_RESTORE` (kcmp) | tidak butuh patch: `vgem` 5.4 dan driver msm sudah punya `DRIVER_RENDER` |
+## Kalau HP stuck di logo
 
-Perbedaan dari rova: patch `focaltech`, `mdss-pll`, dan `vgem render node` **tidak dipakai**.
-Ketiganya khusus tree 4.19 msm8937 dan tidak relevan di stone.
+Penyebab paling umum di kernel QGKI: modul vendor ditolak karena CRC symbol atau `uname -r` berubah.
 
-Urutan penerapan ada di `modules/order.txt`. Opsi kustom milikmu sendiri taruh di
-`configs/extra.config` (selalu di-merge paling akhir).
+1. Jalankan sekali dengan `abi_check` aktif dan baca `abi-report`. Kalau ada CRC berubah, coba `kabi_variant` lain (`3_4_5` lalu `1_2_3`) atau matikan fitur yang menggeser struct.
+2. Pastikan `kernel_ref` sama dengan sumber kernel ROM, dan `expected_release` terisi.
+3. Simpan `boot.img` asli. Pulihkan dengan `fastboot flash boot boot.img`.
 
-## Menambah modul
-1. Buat `modules/<nama>/` berisi:
-   - `module.conf` (`DESC`, `REQUIRES`, `CONFLICTS`, `WANT`, `WANT_NOT`)
-   - `patches/*.patch` (opsional)
-   - `<nama>.config` (opsional, fragment config)
-   - `pre.sh` (opsional, dijalankan di root tree kernel sebelum patch)
-   - `skip-if.txt` (opsional; `namapatch|file|regex`, patch dilewati bila regex sudah ada di file)
-2. Tambahkan `<nama>` di `modules/order.txt`.
-3. Tambahkan satu input boolean dan satu baris `add` di `.github/workflows/build-kernel.yml`.
+## Catatan
 
-Patch yang sudah ada di tree (dan tidak punya `skip-if`) dideteksi lewat `git apply -R --check`
-dan dilewati tanpa membuat build gagal.
-
-## Build lokal
-```
-export CI_META_DIR=$PWD/.build-meta BAKASU_REF=main
-scripts/apply-modules.sh ~/kernel/stone bakasu,droidspaces,systemd,anland   # atau all / none
-scripts/configure.sh ~/kernel/stone moonstone_defconfig configs/no-lto.config
-scripts/verify-config.sh ~/kernel/stone/out/.config
-cd ~/kernel/stone && . ~/stone-kernel-ci/scripts/env.sh && kmake -j"$(nproc)" Image
-```
-
-## Toolchain
-Default memakai clang apt (Ubuntu 24.04, clang 18) dengan LTO, CFI, dan ShadowCallStack dimatikan
-(`disable_lto`). Clang Ubuntu tidak punya CFI ignore list dan full LTO berat di runner GitHub.
-Kalau kamu ingin LTO/CFI seperti defconfig aslinya, isi `clang_url` dengan tarball toolchain
-AOSP/Neutron dan matikan `disable_lto`.
-
-## Verifikasi di perangkat
-```
-su -c "droidspaces check"
-su -c "zcat /proc/config.gz | grep -E 'KSU|MACVLAN|IP6_NF_NAT|FHANDLE|DRM_VGEM'"
-ls -l /sys/class/drm /dev/dri
-```
-Syarat runtime systemd: Droidspaces harus lebih baru dari 7.1.0 (lihat `droidspaces-backports`).
-Macvlan hanya berguna pada jaringan kabel (mis. Ethernet USB OTG), bukan Wi-Fi.
-
-## Asumsi yang perlu kamu cek
-- **Branch**: upstream hanya punya `16.0`. Kernel-nya sama-sama 5.4.302, tapi isi driver bisa beda
-  dari build Android 15 yang kamu pakai sekarang.
-- **Flash**: `anykernel.sh` mengganti kernel saja (`Image`), A/B otomatis, DTB dianggap ada di
-  `vendor_boot` (boot header v3/v4). Kalau ROM kamu memakai boot image dengan DTB tergabung,
-  ubah target build dan nama file di workflow.
-- **Teruji di sandbox**: semua modul aktif, build penuh `Image` dengan clang 18.1.3 (sama dengan
-  runner `ubuntu-24.04`) selesai tanpa error, 39 menit di 2 core. Cek hook BakaSU lolos.
-- **Belum diuji di perangkat**: boot, root, dan container belum dites di hardware.
+- Tidak diuji di perangkat. Yang sudah diuji: semua patch dan script apply bersih di crdroidandroid/android_kernel_xiaomi_stone (5.4.302, branch 16.0), dan seluruh opsi config lolos `olddefconfig` + verifikasi dengan toolchain host. Kompilasi penuh dengan clang belum dijalankan.
+- `clang_url` default adalah AOSP clang-r383902b (clang 11). LTO + CFI di 5.4 butuh clang AOSP, bukan clang distro.
+- `CONFIG_CFS_BANDWIDTH` dan `CONFIG_CGROUP_PIDS` sengaja tidak diaktifkan (merusak kABI). `--cpus` dan `--pids-limit` Droidspaces tidak akan tersedia.
+- SUSFS tidak disertakan: patch SUSFS 5.4 berhenti di v1.5.5, sedangkan BakaSU main butuh API v2.
+- `path_umount` tidak ada di 5.4, jadi fitur unmount modul BakaSU tidak aktif. Root dan modul tetap jalan.
+- AnyKernel3 hanya mengganti `Image` di partisi boot dan mengatur flag vbmeta otomatis.
