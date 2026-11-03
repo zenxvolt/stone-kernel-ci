@@ -77,6 +77,12 @@ jobs:
       - name: Checkout CI repo
         uses: actions/checkout@v4
 
+      # Files uploaded via the GitHub web UI / committed from Windows or a zip
+      # lose the +x bit, and every helper script below is executed directly.
+      # Without this: "Permission denied" (exit 126) in Prepare / Configure.
+      - name: Make helper scripts executable
+        run: chmod +x scripts/*.sh
+
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
@@ -117,7 +123,11 @@ jobs:
           KABI_VARIANT: ${{ inputs.kabi_variant }}
           BAKASU_REF: ${{ inputs.bakasu_ref }}
         run: |
-          ./scripts/prepare_tree.sh kernel | tee prepare.log
+          # Default step shell is `bash -e` WITHOUT pipefail: a failing script piped
+          # into tee would still look green. Also log stderr, or prepare.log stays
+          # empty exactly when something goes wrong.
+          set -o pipefail
+          ./scripts/prepare_tree.sh kernel 2>&1 | tee prepare.log
 
       - name: Configure
         working-directory: kernel
@@ -237,7 +247,7 @@ jobs:
           path: symvers
       - name: Diff exported symbol CRCs
         run: |
-          ./scripts/abi_diff.sh symvers/symvers-baseline/Module.symvers \
+          bash scripts/abi_diff.sh symvers/symvers-baseline/Module.symvers \
                                 symvers/symvers-custom/Module.symvers abi-report.md \
             || echo "::warning::exported symbol CRCs changed, see abi-report.md"
           cat abi-report.md >> "$GITHUB_STEP_SUMMARY"
