@@ -91,16 +91,23 @@ jobs:
       - name: Download AOSP clang (${{ inputs.clang_version }})
         run: |
           set -eux
-          mkdir -p "$RUNNER_TEMP/clang"
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
-          if ! curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/clang.tar.gz"; then
-            echo "::error::Cannot download ${CLANG_VERSION} from AOSP main. It may have been removed; pick a newer clang-rXXXXXX that exists there."
-            exit 1
+          # googlesource refuses "+archive" tarballs of a whole clang folder
+          # (HTTP 400: too large), so fetch only that folder with a sparse,
+          # blob-less git clone instead.
+          REPO=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          CL="$RUNNER_TEMP/clangrepo"
+          git clone --filter=blob:none --no-checkout --depth 1 --branch main "$REPO" "$CL"
+          AVAIL=$(git -C "$CL" ls-tree -d --name-only HEAD | grep -E '^clang-r[0-9]+[a-z]?$' | sort -V)
+          echo "clang folders on AOSP main:"; echo "$AVAIL"
+          DIR="$CLANG_VERSION"
+          if ! echo "$AVAIL" | grep -qx "$DIR"; then
+            DIR=$(echo "$AVAIL" | tail -n1)
+            echo "::warning::${CLANG_VERSION} is not on AOSP main any more; using the newest one there: ${DIR}"
           fi
-          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
-          rm -f "$RUNNER_TEMP/clang.tar.gz"
-          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/clang/bin/clang" --version | head -n1
+          git -C "$CL" sparse-checkout set --no-cone "/${DIR}/"
+          git -C "$CL" checkout
+          echo "$CL/$DIR/bin" >> "$GITHUB_PATH"
+          "$CL/$DIR/bin/clang" --version | head -n1
 
       - name: Apply patches
         working-directory: kernel
