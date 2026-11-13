@@ -1,38 +1,56 @@
-# stone-kernel-ci
+# moonstone-hyperos-kernel-ci
 
-Build kernel Poco X5 5G (`moonstone_defconfig`, Linux 5.4 QGKI) di GitHub Actions dengan fitur modular:
+Kernel untuk POCO X5 5G (moonstone) di **HyperOS stock**, dibangun dari kernel
+"dinosaur" dare-devil-ex yang sudah terbukti boot di HyperOS, dengan:
 
-| Fitur (input workflow) | Isi |
-|---|---|
-| `enable_bakasu` | BakaSU root, mode **manual hook** (tracepoint hook hanya untuk GKI 5.10+). 6 hook disisipkan otomatis oleh `scripts/bakasu_hooks.py`. |
-| `enable_droidspaces` | Opsi kernel Droidspaces + patch kABI (SYSVIPC/mqueue dipindah ke padding `ANDROID_KABI_*`) supaya CRC symbol tidak berubah. |
-| `enable_network` | `MACVLAN`, `IP6_NF_NAT`, `IP6_NF_TARGET_MASQUERADE` (+ guard IPv6 dan driver USB-Ethernet yang sudah aktif). |
-| `enable_systemd` | Backport untuk systemd 258+ (statx mnt_id/mount_root, utimensat, faccessat2) + `FHANDLE`. `close_range` sudah ada di tree stone, jadi hanya patch 1 sampai 4. |
-| `enable_firewall` | Opsi UFW / Fail2Ban (opsional). |
-| `abi_check` | Build ulang defconfig polos dan bandingkan CRC symbol export. Dua kali waktu build. |
+- **BakaSU** (root) menggantikan KernelSU-Next
+- **semua syarat Droidspaces** (wajib, recommended, dan opsional), kecuali
+  cpu limit (`CFS_BANDWIDTH`) dan process limit (`CGROUP_PIDS`)
+- **backport kernel untuk systemd 258–262**
 
-## Cara pakai
+## Cara kerja
+- Config awal = config kernel dinosaur persis (`configs/dino_base.config`, diambil
+  dari `Image` dinosaur via IKCONFIG). Fitur yang membuat build sebelumnya gagal boot
+  (LTO, CFI, Shadow Call Stack, kprobes, vgem) tetap mati (`keep-dino-safe.config`).
+- Compiler sama dengan dinosaur: AOSP clang r596125 (clang 22).
+- Cara pasang sama dengan zip dinosaur: kernel ke `boot` (ramdisk/OrangeFox tetap),
+  `dtbo` dikosongkan, dtb LineageOS ke `vendor_boot` (ramdisk vendor dan modulnya
+  tidak disentuh), termasuk tambalan IR blaster.
 
-1. Buat repo `stone-kernel-ci`, push isi folder ini.
-2. Actions → **Build stone kernel** → Run workflow.
-3. Isi `kernel_ref` dengan branch yang sama dengan kernel ROM kamu sekarang.
-4. Isi `expected_release` dengan output `uname -r` dari HP (build gagal lebih awal kalau beda).
-5. Unduh artifact `stone-kernel-zip`, flash lewat Kernel Flasher / recovery.
-6. Pasang manager BakaSU dari **commit yang sama** (commit tercetak di `notes.txt`).
+## Build
+Actions → *Build kernel* → **Run workflow**. Semua pilihan default sudah benar.
+Hasil: artifact `moonstone-kernel-zip` (zip AnyKernel3).
 
-## Kalau HP stuck di logo
+Kalau hasil build tidak boot, matikan satu kelompok, build lagi, lalu tes:
+`ds_network` → `ds_cgroup` → `ds_misc` → `systemd` → `bakasu`.
+Dengan semua kelompok mati, isinya sama dengan dinosaur non-KSU yang sudah terbukti jalan.
 
-Penyebab paling umum di kernel QGKI: modul vendor ditolak karena CRC symbol atau `uname -r` berubah.
+## Flash
+1. Backup `boot`, `vendor_boot`, `dtbo` (slot aktif) dan salin ke PC.
+2. Flash zip lewat OrangeFox.
+3. Kalau gagal boot: OrangeFox ikut tidak bisa dibuka (memakai kernel di `boot`).
+   Pulihkan dari PC:
+   ```
+   fastboot getvar current-slot
+   fastboot flash boot_a boot.emmc.win
+   fastboot flash vendor_boot_a vendor_boot.emmc.win
+   fastboot flash dtbo_a dtbo.emmc.win
+   fastboot reboot
+   ```
 
-1. Jalankan sekali dengan `abi_check` aktif dan baca `abi-report`. Kalau ada CRC berubah, coba `kabi_variant` lain (`3_4_5` lalu `1_2_3`) atau matikan fitur yang menggeser struct.
-2. Pastikan `kernel_ref` sama dengan sumber kernel ROM, dan `expected_release` terisi.
-3. Simpan `boot.img` asli. Pulihkan dengan `fastboot flash boot boot.img`.
+## Cek setelah boot
+```
+su -c "uname -r"            # 5.4.302-dino-bakasu
+su -c "droidspaces check"
+```
+Dialog "There's an internal problem with your device" bisa muncul seperti di
+dinosaur: config kernel tidak cocok dengan daftar syarat kernel (VINTF) di HyperOS.
+Tekan OK, tidak berbahaya.
 
-## Catatan
-
-- Tidak diuji di perangkat. Yang sudah diuji: semua patch dan script apply bersih di crdroidandroid/android_kernel_xiaomi_stone (5.4.302, branch 16.0), dan seluruh opsi config lolos `olddefconfig` + verifikasi dengan toolchain host. Kompilasi penuh dengan clang belum dijalankan.
-- `clang_url` default adalah AOSP clang-r383902b (clang 11). LTO + CFI di 5.4 butuh clang AOSP, bukan clang distro.
-- `CONFIG_CFS_BANDWIDTH` dan `CONFIG_CGROUP_PIDS` sengaja tidak diaktifkan (merusak kABI). `--cpus` dan `--pids-limit` Droidspaces tidak akan tersedia.
-- SUSFS tidak disertakan: patch SUSFS 5.4 berhenti di v1.5.5, sedangkan BakaSU main butuh API v2.
-- `path_umount` tidak ada di 5.4, jadi fitur unmount modul BakaSU tidak aktif. Root dan modul tetap jalan.
-- AnyKernel3 hanya mengganti `Image` di partisi boot dan mengatur flag vbmeta otomatis.
+## Isi
+- `patches/0001-remove-ksu-next-hooks.patch`: membuang hook KernelSU-Next dinosaur.
+- `patches/0002-droidspaces-cgroup-prefix.patch`: patch cgroup Droidspaces.
+- `patches/0003-bakasu-manual-hooks.patch`: hook manual BakaSU untuk 5.4.
+- `patches/systemd/`: droidspaces-backports seri 5.4, patch 0001–0004.
+- `configs/`: base dinosaur + fragment per kelompok.
+- `anykernel/anykernel.sh`: skrip flash.

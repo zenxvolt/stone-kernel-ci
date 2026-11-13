@@ -1,0 +1,194 @@
+From 8aac8ff95e2b92c5b0afc0b10b24297ebc51aecd Mon Sep 17 00:00:00 2001
+From: ci <ci@local>
+Date: Fri, 13 Nov 2026 08:44:22 +0700
+Subject: [PATCH] Remove KernelSU-Next manual hooks
+
+BakaSU brings its own hooks (next patch). The KernelSU-Next hooks in
+these files would otherwise trip BakaSU's incompatible-hook check
+(ksu_vfs_read_hook in fs/read_write.c).
+---
+ drivers/input/input.c | 11 -----------
+ fs/exec.c             | 18 ------------------
+ fs/open.c             |  9 ---------
+ fs/read_write.c       | 12 ------------
+ fs/stat.c             |  8 --------
+ kernel/reboot.c       |  1 -
+ 6 files changed, 59 deletions(-)
+
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+index 9c0476667..45fdb9bdf 100644
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -375,22 +375,11 @@ static int input_get_disposition(struct input_dev *dev,
+ 	return disposition;
+ }
+ 
+-
+-#ifdef CONFIG_KSU
+-extern bool ksu_input_hook __read_mostly;
+-extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+-#endif
+-
+ static void input_handle_event(struct input_dev *dev,
+ 			       unsigned int type, unsigned int code, int value)
+ {
+ 	int disposition = input_get_disposition(dev, type, code, &value);
+ 
+-        #ifdef CONFIG_KSU
+-        if (unlikely(ksu_input_hook))
+-		ksu_handle_input_handle_event(&type, &code, &value);
+-        #endif
+-
+ 	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+ 		add_input_randomness(type, code, value);
+ 
+diff --git a/fs/exec.c b/fs/exec.c
+index f6c0acf26..910b407d2 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1904,27 +1904,11 @@ static int __do_execve_file(int fd, struct filename *filename,
+ 	return retval;
+ }
+ 
+-#ifdef CONFIG_KSU
+-extern bool ksu_execveat_hook __read_mostly;
+-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+-			void *envp, int *flags);
+-extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+-				 void *argv, void *envp, int *flags);
+-#endif
+-
+ static int do_execveat_common(int fd, struct filename *filename,
+ 			      struct user_arg_ptr argv,
+ 			      struct user_arg_ptr envp,
+ 			      int flags)
+ {
+-
+-        #ifdef CONFIG_KSU
+-	if (unlikely(ksu_execveat_hook))
+-		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+-	else
+-		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+-        #endif
+-
+ 	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+ }
+ 
+@@ -1942,7 +1926,6 @@ int do_execve(struct filename *filename,
+ {
+ 	struct user_arg_ptr argv = { .ptr.native = __argv };
+ 	struct user_arg_ptr envp = { .ptr.native = __envp };
+-
+ 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+ }
+ 
+@@ -1970,7 +1953,6 @@ static int compat_do_execve(struct filename *filename,
+ 		.is_compat = true,
+ 		.ptr.compat = __envp,
+ 	};
+-
+ 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+ }
+ 
+diff --git a/fs/open.c b/fs/open.c
+index 106a714bd..3f9f5fda8 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -340,11 +340,6 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+ 	return ksys_fallocate(fd, mode, offset, len);
+ }
+ 
+-#ifdef CONFIG_KSU
+-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+-			 int *flags);
+-#endif
+-
+ /*
+  * access() needs to use the real uid/gid, not the effective uid/gid.
+  * We do this by temporarily clearing all FS-related capabilities and
+@@ -358,9 +353,6 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
+ 	struct inode *inode;
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
+-        #ifdef CONFIG_KSU
+-        ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+-        #endif
+ 
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+@@ -450,7 +442,6 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
+ 
+ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ {
+-
+ 	return do_faccessat(dfd, filename, mode);
+ }
+ 
+diff --git a/fs/read_write.c b/fs/read_write.c
+index f53a5fe1b..93d06b4c5 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -443,22 +443,10 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
+ }
+ EXPORT_SYMBOL_NS(kernel_read, ANDROID_GKI_VFS_EXPORT_ONLY);
+ 
+-#ifdef CONFIG_KSU
+-extern bool ksu_vfs_read_hook __read_mostly;
+-extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+-			size_t *count_ptr, loff_t **pos);
+-#endif
+-
+ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
+ 
+-        #ifdef CONFIG_KSU 
+-        if (unlikely(ksu_vfs_read_hook))
+-            ksu_handle_vfs_read(&file, &buf, &count, &pos);
+-        #endif
+-
+-
+ 	if (!(file->f_mode & FMODE_READ))
+ 		return -EBADF;
+ 	if (!(file->f_mode & FMODE_CAN_READ))
+diff --git a/fs/stat.c b/fs/stat.c
+index d19ebbfa9..298eb7766 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -150,10 +150,6 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
+ }
+ EXPORT_SYMBOL(vfs_statx_fd);
+ 
+-#ifdef CONFIG_KSU
+-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+-#endif
+-
+ /**
+  * vfs_statx - Get basic and extra attributes by filename
+  * @dfd: A file descriptor representing the base dir for a relative filename
+@@ -176,10 +172,6 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
+ 	int error = -EINVAL;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+ 
+-        #ifdef CONFIG_KSU
+-        ksu_handle_stat(&dfd, &filename, &flags);
+-        #endif
+-
+ 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+ 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
+ 		return -EINVAL;
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index 3c28bc835..790c2f514 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -310,7 +310,6 @@ DEFINE_MUTEX(system_transition_mutex);
+  *
+  * reboot doesn't sync: do that yourself before calling this.
+  */
+-
+ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+-- 
+2.43.0
+
