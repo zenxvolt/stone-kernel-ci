@@ -109,6 +109,25 @@ jobs:
           echo "$CL/$DIR/bin" >> "$GITHUB_PATH"
           "$CL/$DIR/bin/clang" --version | head -n1
 
+      - name: Restore files missing from the kernel repo
+        working-directory: kernel
+        run: |
+          set -eu
+          # The dinosaur repo's .gitignore has "*.i", so the FT3519T touch
+          # pramboot firmware was never committed (its author built with a
+          # local copy). Take it from the LineageOS moonstone kernel, pinned
+          # to a commit and checked by sha256.
+          F=drivers/input/touchscreen/FT3519T/include/pramboot/FT5452J_Pramboot_V4.1_20210427.i
+          SHA=f9b23c1fb67447830273ba83f28078adbbcf174693f8ab596365ecf35c9516d2
+          LOS=https://raw.githubusercontent.com/xiaomi-sm6375-devs/android_kernel_xiaomi_moonstone/dfbf1e20a3bd42f81c16d80796066a59124107bc
+          if [ ! -f "$F" ]; then
+            mkdir -p "$(dirname "$F")"
+            curl -fsSL --retry 3 "$LOS/$F" -o "$F"
+            echo "$SHA  $F" | sha256sum -c -
+          else
+            echo "$F already present"
+          fi
+
       - name: Apply patches
         working-directory: kernel
         run: |
