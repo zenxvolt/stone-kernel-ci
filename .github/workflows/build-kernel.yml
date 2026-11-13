@@ -1,0 +1,239 @@
+name: Build kernel (moonstone HyperOS - dino base + BakaSU + Droidspaces)
+
+# Standalone CI repo. It takes the dare-devil-ex "dinosaur" kernel source,
+# starts from the exact config of the dinosaur kernel that boots on stock
+# HyperOS (configs/dino_base.config, read out of its Image), swaps
+# KernelSU-Next for BakaSU and adds the missing Droidspaces/systemd pieces.
+# Every addition has its own switch, so a boot problem can be narrowed down
+# here without rebuilding everything by hand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel repo (owner/name)"
+        required: true
+        default: "dare-devil-ex/kernel_xiaomi_stone"
+      kernel_branch:
+        description: "Kernel branch"
+        required: true
+        default: "master"
+      clang_version:
+        description: "AOSP clang from prebuilts/clang/host/linux-x86 (dinosaur used clang-r596125)"
+        required: true
+        default: "clang-r596125"
+      bakasu:
+        description: "BakaSU (root)"
+        type: boolean
+        default: true
+      bakasu_ref:
+        description: "BakaSU branch or tag"
+        required: true
+        default: "main"
+      systemd:
+        description: "systemd 258-262: kernel backports + FHANDLE/AUTOFS/AF_ALG"
+        type: boolean
+        default: true
+      ds_network:
+        description: "Droidspaces network extras: bridge netfilter, nftables, macvlan, IPv6 NAT, UFW/Fail2Ban"
+        type: boolean
+        default: true
+      ds_cgroup:
+        description: "Droidspaces cgroup extras: CGROUP_DEVICE, FAIR_GROUP_SCHED"
+        type: boolean
+        default: true
+      ds_misc:
+        description: "Droidspaces misc: FW_LOADER_COMPRESS"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ARCH: arm64
+      BAKASU: ${{ inputs.bakasu }}
+      BAKASU_REF: ${{ inputs.bakasu_ref }}
+      SYSTEMD: ${{ inputs.systemd }}
+      DS_NETWORK: ${{ inputs.ds_network }}
+      DS_CGROUP: ${{ inputs.ds_cgroup }}
+      DS_MISC: ${{ inputs.ds_misc }}
+      CLANG_VERSION: ${{ inputs.clang_version }}
+
+    steps:
+      - name: Checkout CI files (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          token: ${{ secrets.KERNEL_REPO_TOKEN || github.token }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            flex bison bc cpio zip xz-utils python3 git curl \
+            libssl-dev libelf-dev device-tree-compiler
+
+      - name: Download AOSP clang (${{ inputs.clang_version }})
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/clang"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          if ! curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/clang.tar.gz"; then
+            echo "::error::Cannot download ${CLANG_VERSION} from AOSP main. It may have been removed; pick a newer clang-rXXXXXX that exists there."
+            exit 1
+          fi
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          rm -f "$RUNNER_TEMP/clang.tar.gz"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version | head -n1
+
+      - name: Apply patches
+        working-directory: kernel
+        run: |
+          set -eu
+          apply() {
+            p="$1"
+            if git apply --check --whitespace=nowarn "$p" 2>/dev/null; then
+              git apply --whitespace=nowarn "$p"; echo "applied  $(basename "$p")"
+            elif git apply -R --check --whitespace=nowarn "$p" 2>/dev/null; then
+              echo "already present, skipped  $(basename "$p")"
+            else
+              echo "::error::patch does not apply: $(basename "$p")"
+              git apply --check --whitespace=nowarn "$p" || true
+              exit 1
+            fi
+          }
+          # Always: drop the KernelSU-Next hooks (BakaSU refuses to build next
+          # to them) and the Droidspaces cgroup prefix fix.
+          apply "$GITHUB_WORKSPACE/ci/patches/0001-remove-ksu-next-hooks.patch"
+          apply "$GITHUB_WORKSPACE/ci/patches/0002-droidspaces-cgroup-prefix.patch"
+          if [ "$BAKASU" = "true" ]; then
+            apply "$GITHUB_WORKSPACE/ci/patches/0003-bakasu-manual-hooks.patch"
+          fi
+          if [ "$SYSTEMD" = "true" ]; then
+            for p in "$GITHUB_WORKSPACE"/ci/patches/systemd/*.patch; do apply "$p"; done
+          fi
+
+      - name: Add BakaSU
+        if: ${{ inputs.bakasu }}
+        working-directory: kernel
+        run: |
+          set -eux
+          # The dinosaur tree has the KernelSU-Next config but no
+          # drivers/kernelsu; BakaSU's setup script adds the driver and wires
+          # drivers/Makefile + drivers/Kconfig.
+          curl -fsSL "https://raw.githubusercontent.com/Baka-SU/BakaSU/${BAKASU_REF}/kernel/setup.sh" -o "$RUNNER_TEMP/bakasu-setup.sh"
+          sh "$RUNNER_TEMP/bakasu-setup.sh" "${BAKASU_REF}"
+          ls -l drivers/kernelsu
+          git -C KernelSU log -1 --format='BakaSU commit: %h %s'
+
+      - name: Configure (dinosaur config + selected fragments)
+        working-directory: kernel
+        run: |
+          set -eux
+          C="$GITHUB_WORKSPACE/ci/configs"
+          FR=()
+          [ "$BAKASU" = "true" ] && FR+=( "$C/bakasu.config" )
+          [ "$DS_NETWORK" = "true" ] && FR+=( "$C/droidspaces-network.config" )
+          [ "$DS_CGROUP" = "true" ] && FR+=( "$C/droidspaces-cgroup.config" )
+          [ "$DS_MISC" = "true" ] && FR+=( "$C/droidspaces-misc.config" )
+          [ "$SYSTEMD" = "true" ] && FR+=( "$C/systemd.config" )
+          FR+=( "$C/keep-dino-safe.config" )
+          mkdir -p out
+          cp "$C/dino_base.config" out/.config
+          scripts/kconfig/merge_config.sh -m -O out out/.config "${FR[@]}"
+          make O=out LLVM=1 LLVM_IAS=1 CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            olddefconfig
+          printf '%s\n' "${FR[@]}" > "$GITHUB_WORKSPACE/fragments.txt"
+
+      - name: Verify final .config
+        working-directory: kernel
+        run: |
+          fail=0
+          for f in $(cat "$GITHUB_WORKSPACE/fragments.txt"); do
+            while IFS= read -r l; do
+              grep -qxF "$l" out/.config || { echo "NOT SET: $l  ($(grep -E "^(# )?${l%%=*}[ =]" out/.config))"; fail=1; }
+            done < <(grep -E '^CONFIG_[A-Z0-9_]+=' "$f")
+            for s in $(grep -E '^# CONFIG_[A-Z0-9_]+ is not set' "$f" | awk '{print $2}'); do
+              grep -q "^$s=y" out/.config && { echo "STILL ON: $s"; fail=1; }
+            done
+          done
+          echo "== changes vs the dinosaur config (compiler lines hidden)"
+          diff <(grep -E '^CONFIG_' "$GITHUB_WORKSPACE/ci/configs/dino_base.config" | sort) \
+               <(grep -E '^CONFIG_' out/.config | sort) \
+            | grep -vE 'CC_VERSION|CLANG_VERSION|LLD_VERSION|AS_VERSION|_HAS_|CC_IS|CC_CAN_LINK|TOOLS_SUPPORT|PAHOLE' || true
+          exit $fail
+
+      - name: Build Image and dtbs
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          MK="make -j$(nproc) O=out LLVM=1 LLVM_IAS=1 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          # BakaSU includes generated headers without declaring them; make them first.
+          $MK security/selinux/ init/version.o 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          # -k: list every failing file in one run.
+          $MK -k Image dtbs 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          strings out/arch/arm64/boot/Image | grep -m1 'Linux version'
+          ls -l out/arch/arm64/boot/Image out/arch/arm64/boot/dts/vendor/xiaomi/moonstone.dtb
+
+      - name: Summarize compile errors
+        if: failure()
+        run: |
+          echo "### Compile errors" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E ' error: |\*\*\* \[' build.log | sort -u | head -n 60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -eux
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+          cp ci/anykernel/anykernel.sh AnyKernel3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          # dtb exactly like the dinosaur zip (LineageOS moonstone.dtb) plus a
+          # copy with the IR blaster fix that anykernel.sh picks when the
+          # vendor ships the consumerir HAL.
+          cp kernel/out/arch/arm64/boot/dts/vendor/xiaomi/moonstone.dtb AnyKernel3/dtb
+          mkdir -p AnyKernel3/alt
+          cp AnyKernel3/dtb AnyKernel3/alt/dtb-ir-spi
+          fdtput AnyKernel3/alt/dtb-ir-spi /soc/spi@4a88000/irled@0 compatible ir-spi -t s
+          fdtget AnyKernel3/alt/dtb-ir-spi /soc/spi@4a88000/irled@0 compatible
+          TAG=dino-bakasu
+          [ "$BAKASU" = "true" ] || TAG=dino-noroot
+          ZIP="moonstone-${TAG}-$(date +%Y%m%d-%H%M).zip"
+          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP" . -x '*.placeholder')
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonstone-kernel-zip
+          path: ${{ env.ZIP }}
+
+      - name: Upload build log and .config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-and-config
+          include-hidden-files: true
+          path: |
+            build.log
+            kernel/out/.config
+          if-no-files-found: ignore
